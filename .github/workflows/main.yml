@@ -1,0 +1,135 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure RDP & TLS Support
+        run: |
+          # Set warna output terminal agar lebih enak dilihat
+          $Host.UI.RawUI.ForegroundColor = "Cyan"
+          
+          Write-Host "🛠️  Konfigurasi RDP & Security Layer..." -ForegroundColor Cyan
+          
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Konfigurasi Security Layer untuk Support TLS yang lebih baik
+          # 1 = Negotiate (Rekomendasi untuk kompatibilitas & keamanan)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 1 -Force
+          
+          # Matikan NLA (Network Level Authentication) agar koneksi lebih smooth kadang diperlukan oleh tools tertentu
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+
+          # Set Firewall Rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 profile=any
+
+          # Matikan Password Complexity agar password simple bisa diterima
+          secedit /export /cfg "$env:TEMP\secpol.cfg" > $null
+          (Get-Content "$env:TEMP\secpol.cfg") -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content "$env:TEMP\secpol.cfg"
+          secedit /configure /db secpol.sdb /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY > $null
+          Remove-Item "$env:TEMP\secpol.cfg" -Force
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create User "Moonton"
+        run: |
+          Write-Host "👤 Membuat User: Moonton..." -ForegroundColor Green
+          $password = ConvertTo-SecureString "Moonton123" -AsPlainText -Force
+          
+          # Hapus user jika ada sebelumnya (untuk clean state)
+          if (Get-LocalUser -Name "Moonton" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "Moonton" -Force
+          }
+          
+          New-LocalUser -Name "Moonton" -Password $password -AccountNeverExpires -FullName "Moonton User"
+          Add-LocalGroupMember -Group "Administrators" -Member "Moonton"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Moonton"
+          
+          # Set agar tidak perlu ganti password saat login pertama
+          Set-LocalUser -Name "Moonton" -PasswordNeverExpires $true
+          
+          Write-Host "✅ User Moonton berhasil dibuat." -ForegroundColor Green
+
+      - name: Install Python Dependencies for Script
+        run: |
+          Write-Host "🐍 Menginstall Library Python (Selenium Support)..." -ForegroundColor Yellow
+          # Upgrade pip
+          python -m pip install --upgrade pip
+          # Install library yang dibutuhkan script Anda
+          pip install undetected-chromedriver pynput requests
+          Write-Host "✅ Library Python siap." -ForegroundColor Green
+
+      - name: Install Tailscale
+        run: |
+          Write-Host "🌐 Menginstall Tailscale..." -ForegroundColor Magenta
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Connect Tailscale
+        run: |
+          Write-Host "🔗 Menghubungkan ke Tailscale..." -ForegroundColor Magenta
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-moonton-$env:GITHUB_RUN_ID
+          
+          # Wait for IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "❌ Gagal mendapatkan IP Tailscale"
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale Terhubung: $tsIP" -ForegroundColor Green
+
+      - name: 🖥️ RDP Connection Info (Soft UI)
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host "       RDP ACCESS READY - MOONTON VPS       " -ForegroundColor Cyan
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+          Write-Host " Host/IP   : $env:TAILSCALE_IP" -ForegroundColor Yellow
+          Write-Host " Port      : 3389" -ForegroundColor Yellow
+          Write-Host " Username  : Moonton" -ForegroundColor Yellow
+          Write-Host " Password  : Moonton123" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host " Status    : Python & Selenium Dependencies Installed" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "============================================" -ForegroundColor Cyan
+          Write-Host ""
+
+      - name: Keep Connection Alive
+        run: |
+          Write-Host "🔄 Menjaga koneksi tetap hidup..." -ForegroundColor DarkGray
+          # Loop infinity
+          while ($true) {
+              # Cek koneksi Tailscale, jika mati coba reconnect
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status -json 2>$null | ConvertFrom-Json
+              if (-not $status.BackendState -eq "Running") {
+                  Write-Host "⚠️ Tailscale terputus, mencoba reconnect..." -ForegroundColor Red
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
+              }
+              
+              Write-Host "[$(Get-Date -Format "HH:mm:ss")] RDP Still Active... (Press Stop to terminate)" -ForegroundColor Gray
+              Start-Sleep -Seconds 300
+          }
